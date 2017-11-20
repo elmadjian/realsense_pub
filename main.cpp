@@ -1,4 +1,3 @@
-
 #include <librealsense/rs.hpp>
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
@@ -6,22 +5,24 @@
 #include <opencv2/imgcodecs.hpp>
 #include <iostream>
 #include <string>
+#include <zmq.hpp>
+#include <cmath>
 #include "markerdetector.h"
-#include "tcpacceptor.h"
-#include "tcpstream.h"
 
-#define WIDTH 640
-#define HEIGHT 480
+
+#define WIDTH 320
+#define HEIGHT 240
 
 using namespace std;
 using namespace cv;
 using namespace rs;
+using namespace zmq;
 
 
-
-float3 filterCoords(vector<vector<double>>*, const float3);
-double findValidNeighborDepth(const float, const uint16_t*, int, int);
-void sendMessage(const float3, TCPStream*);
+float3 filterCoords(vector<vector<double>>*, const float3, float3);
+double findValidNeighborDepth(double, const float, const uint16_t*, int, int);
+void sendCoords(const float3, socket_t*);
+float filterZOutlier(float, float);
 
 
 int main()
@@ -51,20 +52,17 @@ int main()
 
     //some placeholders
     Mat color, output, depth;
+    int k = 0;
+    double prevDepth = 0;
 
     //detecting marker on scene
     MarkerDetector *md = new MarkerDetector();
     string code = "0000000110010100001000000";
 
     //starting network
-    TCPStream* stream;
-    TCPAcceptor* acceptor = new TCPAcceptor(7777, "127.0.0.1");
-    if (acceptor->start() != 0) {
-        perror("Could not start network");
-        exit(-1);
-    }
-    stream = acceptor->accept(); //blocks!!!
-    cout << "client connected!" << endl;
+    context_t context(1);
+    socket_t socket (context, ZMQ_PUB);
+    socket.bind("tcp://127.0.0.1:7777");
 
     //preparing coords vector
     vector<vector<double>> xyz;
@@ -72,7 +70,10 @@ int main()
         vector<double> v = {0.0, 0.0, 0.0, 0.0, 0.0};
         xyz.push_back(v);
     }
-    int change = 0;
+    float3 filtered;
+    filtered.x = 0;
+    filtered.y = 0;
+    filtered.z = 0;
 
 
     for (;;) {
@@ -93,46 +94,59 @@ int main()
                 int x = md->centroidF.x;
                 int y = md->centroidF.y;
                 depthVal = scale * depthImg[y*(WIDTH-1)+x];
-                if (depthVal == 0)
-                    depthVal = findValidNeighborDepth(scale, depthImg, x, y);
+                double diff = abs(depthVal - prevDepth);
+                if (depthVal == 0 || (diff > 0.15 && prevDepth != 0))
+                    depthVal = findValidNeighborDepth(prevDepth, scale, depthImg, x, y);
+                prevDepth = depthVal;
                 intrinsics intr = dev->get_stream_intrinsics(stream::rectified_color);
 
                 //cout <<"centroid: " << x << "," << y << "  Depth value: " << depthVal << endl;
                 const float2 pixel = {x = (float)x, y = (float)y};
                 const float3 coord = intr.deproject(pixel, depthVal);
-                filterCoords(&xyz, coord);
-                if (change == 0)
-                    sendMessage(coord, stream);
-                change = (change+1)%3;
+                filtered = filterCoords(&xyz, coord, filtered);
+                //sendCoords(coord, &socket);
+                string coords = to_string(filtered.x) + ";"\
+                        + to_string(filtered.y)       + ";"\
+                        + to_string(filtered.z)       + "\r\n";
+                message_t msg(coords.length());
+
+                snprintf((char*) msg.data(), coords.length(), coords.data());
+                k = (k+1)%2;
+                if (k == 0) {
+                    socket.send(msg);
+                    cout << filtered.z << endl;
+                }
+
             }
             if ('q' == waitKey(10))
                 break;
         }
     }
-    delete stream;
 }
 
-double findValidNeighborDepth(const float scale, const uint16_t *depthImg, int x, int y) {
+double findValidNeighborDepth(double prevDepth, const float scale, const uint16_t *depthImg, int x, int y) {
     double d0, d1, d2, d3;
-    for (int i = 1; i < 100; i++) {
-        d0 = depthImg[y*(WIDTH-1)+x+i];
-        d1 = depthImg[y*(WIDTH-1)+x-i];
-        d2 = depthImg[(y+i)*(WIDTH-1)+x];
-        d3 = depthImg[(y-i)*(WIDTH-1)+x];
-        if (d0 != 0) return d0*scale;
-        if (d1 != 0) return d1*scale;
-        if (d2 != 0) return d2*scale;
-        if (d3 != 0) return d3*scale;
+    double thresh = 0.2;
+    for (int i = 1; i < 75; i++) {
+        d0 = scale * depthImg[y*(WIDTH-1)+x+i];
+        d1 = scale * depthImg[y*(WIDTH-1)+x-i];
+        d2 = scale * depthImg[(y+i)*(WIDTH-1)+x];
+        d3 = scale * depthImg[(y-i)*(WIDTH-1)+x];
+        if (d0 != 0 && abs(d0 - prevDepth) < thresh) return d0;
+        if (d1 != 0 && abs(d1 - prevDepth) < thresh) return d1;
+        if (d2 != 0 && abs(d2 - prevDepth) < thresh) return d2;
+        if (d3 != 0 && abs(d3 - prevDepth) < thresh) return d3;
     }
     return 0;
 }
 
-float3 filterCoords(vector<vector<double>> *xyz, const float3 coord) {
+float3 filterCoords(vector<vector<double>> *xyz, const float3 coord, float3 prev) {
     vector<double> sum = {0, 0, 0};
     float3 filtered;
     xyz->at(0).push_back(coord.x);
-    xyz->at(1).push_back(coord.y);
-    xyz->at(2).push_back(coord.z);
+    xyz->at(1).push_back(coord.y*(-1));
+    float z = filterZOutlier(coord.z, prev.z);
+    xyz->at(2).push_back(z);
 
     for (int i = 0; i < 3; i++) {
         xyz->at(i).erase(xyz->at(i).begin());
@@ -142,19 +156,27 @@ float3 filterCoords(vector<vector<double>> *xyz, const float3 coord) {
     filtered.x = sum.at(0)/5.0;
     filtered.y = sum.at(1)/5.0;
     filtered.z = sum.at(2)/5.0;
-    cout << filtered.z << endl;
+    //cout << coord.z << "___" << filtered.z << endl;
     return filtered;
 }
 
-void sendMessage(const float3 coord, TCPStream* stream) {
-    char msg[1024];
-    string coords = to_string(coord.x) +";"\
+float filterZOutlier(float coordZ, float filteredZ) {
+    if (coordZ > filteredZ + 0.3)
+        return filteredZ + 0.005;
+    else if (coordZ < filteredZ - 0.3)
+        return filteredZ - 0.005;
+    else
+        return coordZ;
+}
+
+void sendCoords(const float3 coord, socket_t *socket) {
+    string coords = to_string(coord.x) + ";"\
             + to_string(coord.y)       + ";"\
             + to_string(coord.z)       + "\r\n";
+    message_t msg(coords.length());
 
-    msg[coords.length()] = 0;
-    snprintf(msg, coords.length(), coords.data());
-    stream->send(msg, coords.length());
+    snprintf((char*) msg.data(), coords.length(), coords.data());
+    socket->send(msg);
 }
 
 

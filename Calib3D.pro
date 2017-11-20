@@ -13,6 +13,7 @@ LIBS += /usr/local/lib64/librealsense.so\
         -lopencv_highgui\
         -lopencv_imgproc\
         -lopencv_imgcodecs\
+        -lzmq\
 
 HEADERS += \
     markerdetector.h \
